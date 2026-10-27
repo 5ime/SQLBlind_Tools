@@ -16,9 +16,16 @@ def recursive_unquote(value: str, plus_as_space: bool = False, rounds: int = 8) 
     return decoded
 
 
+_NON_HEX = str.maketrans("", "", "0123456789abcdefABCDEF")
+
+
 def is_hex_string(value: str) -> bool:
     stripped = value.strip()
-    return bool(stripped) and len(stripped) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", stripped) is not None
+    n = len(stripped)
+    if n < 2 or n % 2:
+        return False
+    # translate-away hex digits; empty remainder ⇒ pure hex (faster than fullmatch on MB bodies)
+    return not stripped.translate(_NON_HEX)
 
 
 def decode_hex_payload(value: str) -> str:

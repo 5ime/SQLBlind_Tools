@@ -156,8 +156,14 @@ def build_length_classifier(
 def build_time_classifier(
     observations: list[ProbeObservation],
 ) -> tuple[TruthClassifier | None, str, float]:
-    sample_text = " ".join(o.request.haystack.lower() for o in observations[:80])
-    allow = any(o.time_based for o in observations) or any(k in sample_text for k in TIME_KEYWORDS)
+    allow = any(o.time_based for o in observations)
+    if not allow:
+        # Avoid joining full haystacks — scan a small sample of path prefixes only.
+        for o in observations[:40]:
+            path = o.request.path[:240].lower()
+            if any(k in path for k in TIME_KEYWORDS):
+                allow = True
+                break
     if not allow:
         return None, "", 0.0
 

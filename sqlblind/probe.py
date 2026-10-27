@@ -48,25 +48,40 @@ LEAST_ORDINAL_IN_RE = re.compile(
 )
 
 
+_CANON_SUBS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"/\*.*?\*/"), " "),
+    (re.compile(r"\s+"), " "),
+    (re.compile(r"\bsubstring\b"), "substr"),
+    (re.compile(r"\bmid\b"), "substr"),
+    (re.compile(r"\bascii\b"), "ord"),
+    (re.compile(r"\bunicode\b"), "ord"),
+    (re.compile(r"\bchar_length\b"), "length"),
+    (re.compile(r"\boctet_length\b"), "length"),
+    (re.compile(r"\blen\b"), "length"),
+    (re.compile(r"\s*,\s*"), ","),
+    (re.compile(r"\(\s+"), "("),
+    (re.compile(r"\s+\)"), ")"),
+    (re.compile(r"\bchar\(\d+\)"), "char(?)"),
+    (re.compile(r"\brand\(\)"), "rand()"),
+)
+
+# Cheap gate: skip expensive probe regexes on unrelated HTTP noise.
+_PROBE_HINT_RE = re.compile(
+    r"(?i)(?:substr|substring|\bmid\s*\(|\bascii\s*\(|\bord\s*\(|\bunicode\s*\(|"
+    r"\blength\s*\(|char_length|octet_length|\blen\s*\(|"
+    r"sleep\s*\(|benchmark\s*\(|pg_sleep|waitfor\s+delay|least\s*\(|greatest\s*\()"
+)
+
+
 def canonicalize_sql_snippet(text: str) -> str:
-    lowered = text.lower()
-    lowered = re.sub(r"/\*.*?\*/", " ", lowered)
-    lowered = lowered.replace("+", " ")
-    lowered = re.sub(r"\s+", " ", lowered).strip()
-    lowered = re.sub(r"\bsubstring\b", "substr", lowered)
-    lowered = re.sub(r"\bmid\b", "substr", lowered)
-    lowered = re.sub(r"\bascii\b", "ord", lowered)
-    lowered = re.sub(r"\bunicode\b", "ord", lowered)
-    lowered = re.sub(r"\bchar_length\b", "length", lowered)
-    lowered = re.sub(r"\boctet_length\b", "length", lowered)
-    lowered = re.sub(r"\blen\b", "length", lowered)
-    lowered = re.sub(r"\s*,\s*", ",", lowered)
-    lowered = re.sub(r"\(\s+", "(", lowered)
-    lowered = re.sub(r"\s+\)", ")", lowered)
-    # random salt / noise
-    lowered = re.sub(r"\bchar\(\d+\)", "char(?)", lowered)
-    lowered = re.sub(r"\brand\(\)", "rand()", lowered)
-    return lowered
+    lowered = text.lower().replace("+", " ")
+    for pattern, repl in _CANON_SUBS:
+        lowered = pattern.sub(repl, lowered)
+    return lowered.strip()
+
+
+def _may_contain_probe(text: str) -> bool:
+    return _PROBE_HINT_RE.search(text) is not None
 
 
 def parse_literal(raw_value: str) -> tuple[int | None, str | None]:
@@ -139,9 +154,7 @@ def extract_observations_from_text(text: str, record: HTTPRequestRecord) -> list
         val = int(match.group("val"))
         # least(x, N) in (N)  <=>  x >= N when bound == val
         # greatest(x, N) in (N) <=> x <= N
-        func = match.group(0).lower()
-        operator = ">=" if func.lstrip().startswith("least") or "least(" in canonicalize_sql_snippet(match.group(0)[:20]) else "<="
-        head = canonicalize_sql_snippet(match.group(0)[:30])
+        head = match.group(0).lstrip().lower()
         operator = ">=" if head.startswith("least") else "<="
         candidate_raw = match.group("val")
         add(
@@ -273,5 +286,8 @@ def extract_observations_from_text(text: str, record: HTTPRequestRecord) -> list
 def extract_observations(records: list[HTTPRequestRecord]) -> list[ProbeObservation]:
     observations: list[ProbeObservation] = []
     for record in records:
-        observations.extend(extract_observations_from_text(record.haystack, record))
+        haystack = record.haystack
+        if not _may_contain_probe(haystack):
+            continue
+        observations.extend(extract_observations_from_text(haystack, record))
     return observations
