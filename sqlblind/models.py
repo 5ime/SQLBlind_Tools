@@ -12,6 +12,7 @@ class Config:
     output_requests: Path | None = None
     regexp: str | None = None
     json_output: Path | None = None
+    export_bin: Path | None = None
     top: int = 5
     max_records: int | None = None
     engine: str = "tshark"
@@ -89,9 +90,20 @@ class AnalysisResult:
     observation_count: int = 0
     notes: list[str] = field(default_factory=list)
     shape_hint: str = ""
+    file_type: str = ""
+    file_ext: str = ""
+    file_size: int | None = None
+    file_bytes: bytes | None = field(default=None, repr=False)
+    embedded_flags: list[str] = field(default_factory=list)
+    exported_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        # Keep JSON serializable / compact.
+        payload.pop("file_bytes", None)
+        if self.file_size is not None:
+            payload["file_size"] = self.file_size
+        return payload
 
 
 class ToolError(RuntimeError):

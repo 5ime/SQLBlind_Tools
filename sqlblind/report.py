@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+from .magic import FLAG_RE
 from .models import AnalysisResult, Config, HTTPRequestRecord
-from .solver import FLAG_RE
 
 ANSI_RESET = "\033[0m"
 ANSI_RED = "\033[91m"
@@ -82,9 +82,21 @@ def summarize_capture(records: list[HTTPRequestRecord]) -> str:
 
 
 def print_request_samples(records: list[HTTPRequestRecord], sample_limit: int) -> None:
-    unique_records = deduplicate_preserve_order(records)
+    if sample_limit <= 0:
+        return
+    # Early-exit dedupe — do not scan the entire capture just for samples.
+    seen: set[str] = set()
+    samples: list[HTTPRequestRecord] = []
+    for record in records:
+        signature = record.rendered
+        if signature in seen:
+            continue
+        seen.add(signature)
+        samples.append(record)
+        if len(samples) >= sample_limit:
+            break
     print(colorize("[-] HTTP 请求取样...", ANSI_BLUE))
-    for record in unique_records[:sample_limit]:
+    for record in samples:
         print(record.rendered)
         print("-" * 80)
 
@@ -100,20 +112,53 @@ def print_builtin_analysis(result: AnalysisResult, index: int | None = None) -> 
         print(colorize(f"[*] 目标 {index}:", ANSI_MAGENTA), result.target_key)
     print(colorize("[*] 判定方式:", ANSI_MAGENTA), result.truth_source)
     print(colorize("[*] 极性置信度:", ANSI_MAGENTA), f"{result.polarity_confidence:.2f}")
-    for note in result.notes:
-        print(colorize("[*] " + note, ANSI_MAGENTA))
+
+    if result.file_type and result.file_size is not None:
+        loc = f" -> {result.exported_path}" if result.exported_path else ""
+        print(
+            colorize("[+] 文件:", ANSI_GREEN),
+            f"{result.file_type} ({result.file_size} bytes){loc}",
+        )
+
+    if result.embedded_flags:
+        print(colorize("[+] 文件内嵌 flag:", ANSI_GREEN))
+        for flag in result.embedded_flags:
+            print(highlight_flag(flag))
 
     if result.recovered_text:
-        print(colorize("[+] 提取到的数据:", ANSI_GREEN))
-        display = result.recovered_text
-        if len(display) > 500:
-            print(highlight_flag(display[:500]) + f"... ({len(display)} chars)")
+        # Avoid dumping huge hex / duplicating already-printed embedded flags.
+        if result.embedded_flags and result.recovered_text in result.embedded_flags:
+            pass
+        elif result.file_type and not FLAG_RE.search(result.recovered_text):
+            print(
+                colorize("[+] 提取到的数据:", ANSI_GREEN),
+                f"<{result.file_type} binary, {result.file_size} bytes>",
+            )
         else:
-            print(highlight_flag(display))
-    elif result.inferred_length is not None:
+            print(colorize("[+] 提取到的数据:", ANSI_GREEN))
+            display = result.recovered_text
+            if len(display) > 500:
+                print(highlight_flag(display[:500]) + f"... ({len(display)} chars)")
+            else:
+                print(highlight_flag(display))
+    elif result.inferred_length is not None and not result.file_type:
         print(colorize("[!] 仅推断出长度，未能还原字符内容。", ANSI_YELLOW))
-    else:
+    elif not result.file_type and not result.embedded_flags:
         print(colorize("[!] 未能从内置规则中恢复结果，请尝试自定义正则。", ANSI_RED))
+
+
+def export_binary_payloads(results: list[AnalysisResult], output_dir: Path) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for index, result in enumerate(results, start=1):
+        if not result.file_bytes or not result.file_ext:
+            continue
+        name = f"recovered_{index}{result.file_ext}"
+        path = output_dir / name
+        path.write_bytes(result.file_bytes)
+        result.exported_path = str(path)
+        written += 1
+    return written
 
 
 def print_custom_analysis(matches: list[str]) -> None:

@@ -7,6 +7,7 @@ from .models import AnalysisResult, Config, HTTPRequestRecord, ToolError
 from .probe import extract_observations
 from .report import (
     colorize,
+    export_binary_payloads,
     export_requests,
     print_builtin_analysis,
     print_custom_analysis,
@@ -80,8 +81,13 @@ def run_cli(config: Config) -> int:
         return 1
 
     print(colorize("[*] 识别到目标数量:", ANSI_MAGENTA), str(len(analysis_results)))
-    for index, result in enumerate(analysis_results[: config.top], start=1):
+    top_results = analysis_results[: config.top]
+    if config.export_bin is not None:
+        n = export_binary_payloads(top_results, config.export_bin)
+        if n:
+            print(colorize("[+] 二进制已导出:", ANSI_GREEN), str(config.export_bin), f"({n} files)")
+    for index, result in enumerate(top_results, start=1):
         print_builtin_analysis(result, index=index)
 
-    write_json_report(config, records, analysis_results[: config.top])
+    write_json_report(config, records, top_results)
     return 0

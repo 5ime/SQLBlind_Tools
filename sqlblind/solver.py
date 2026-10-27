@@ -3,12 +3,12 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 
+from .magic import FLAG_RE, analyze_binary_payload
 from .models import AnalysisResult, ProbeObservation
 from .signal import TruthClassifier, build_truth_classifier, group_by_target, response_body_metric
 
-FLAG_RE = re.compile(r"(?:flag|ctf|dasctf)(\[[^\]]+\]|\{[^}]+\})", re.IGNORECASE)
-PNG_HEX_RE = re.compile(r"^89504e47", re.IGNORECASE)
-HEX_BLOB_RE = re.compile(r"^[0-9a-fA-F]{32,}$")
+# Re-export for callers that historically imported FLAG_RE from solver.
+__all__ = ["FLAG_RE", "analyze_builtin_groups", "analyze_custom_regex", "analyze_target"]
 
 
 def apply_numeric_constraint(
@@ -130,14 +130,13 @@ def position_all_false(
     return judged >= max(3, len(probes) // 4)
 
 
-def numeric_to_display(value: int) -> tuple[str, str | None]:
-    """Return (display_char, note). Non-ASCII ord results are marked."""
+def numeric_to_display(value: int) -> str:
+    """Return display form for an ordinal probe result."""
     if 32 <= value <= 126:
-        return chr(value), None
+        return chr(value)
     if value < 0 or value > 255:
-        return "?", f"异常码点 {value}"
-    # likely UTF-8 lead / non-printable
-    return f"\\x{value:02x}", f"非 ASCII 字节 0x{value:02x}（可能是多字节字符首字节）"
+        return "?"
+    return f"\\x{value:02x}"
 
 
 def infer_group_value(
@@ -184,20 +183,43 @@ def infer_group_value(
 
 
 def detect_shape(text: str) -> str:
-    # Strip \\xHH markers before hex-shape detection so ciphertext with a few
-    # non-ASCII bytes is not mislabeled as a hex blob.
+    """Classify recovered blob shape for structured output."""
+    payload = analyze_binary_payload(text)
+    if payload and payload.magic:
+        return payload.magic.name
     without_escapes = re.sub(r"\\x[0-9a-fA-F]{2}", "?", text)
-    hex_only = re.sub(r"[^0-9a-fA-F]", "", without_escapes)
-    if PNG_HEX_RE.match(hex_only) or without_escapes.lower().lstrip("?").startswith("89504e47"):
-        return "疑似 PNG 十六进制（可用 xxd/unhex 还原图片）"
-    if len(hex_only) >= 64 and len(hex_only) >= int(len(without_escapes) * 0.9) and HEX_BLOB_RE.match(hex_only):
-        return "疑似长十六进制串"
     if FLAG_RE.search(text):
-        return "含 flag 形态"
+        return "flag"
     letters = sum(1 for ch in without_escapes if ch.isalpha())
-    if len(without_escapes) >= 40 and letters / max(len(without_escapes), 1) > 0.55 and not FLAG_RE.search(text):
-        return "疑似密文/自然语言文本（盲注已还原原始串，未做二次解密）"
+    if len(without_escapes) >= 40 and letters / max(len(without_escapes), 1) > 0.55:
+        return "text"
     return ""
+
+
+def enrich_recovered_result(result: AnalysisResult) -> None:
+    """Detect file magic, pull embedded flags out of hex/binary recoveries."""
+    text = result.recovered_text
+    if not text:
+        return
+    payload = analyze_binary_payload(text)
+    if payload is None:
+        if not result.shape_hint:
+            result.shape_hint = detect_shape(text)
+        return
+
+    if payload.magic:
+        result.shape_hint = payload.magic.name
+        result.file_type = payload.magic.name
+        result.file_ext = payload.magic.ext
+        result.file_size = len(payload.data)
+        result.file_bytes = payload.data
+    if payload.embedded_flags:
+        result.embedded_flags = payload.embedded_flags
+        # Promote embedded flag when the surface text is opaque hex/binary.
+        if not FLAG_RE.search(text):
+            result.recovered_text = payload.embedded_flags[0]
+    elif not result.shape_hint:
+        result.shape_hint = payload.magic.name if payload.magic else detect_shape(text)
 
 
 def _logical_length(text: str) -> int:
@@ -232,12 +254,10 @@ def invert_classifier(classifier: TruthClassifier) -> TruthClassifier:
 def recover_characters(
     position_groups: dict[int, list[ProbeObservation]],
     truth_classifier: TruthClassifier | None,
-) -> tuple[str, list[str], bool]:
-    """Return (text, notes, ended_by_all_false)."""
-    notes: list[str] = []
+) -> tuple[str, bool]:
+    """Return (text, ended_by_all_false)."""
     recovered_characters: list[str] = []
     ended = False
-    multibyte_notes = 0
 
     for position in sorted(position_groups):
         if ended:
@@ -247,26 +267,20 @@ def recover_characters(
         if all_false:
             if recovered_characters:
                 ended = True
-                notes.append(f"位置 {position} 起探针全假，截断字符串")
                 break
             recovered_characters.append("?")
             continue
         if recovered is None:
             recovered_characters.append("?")
         elif isinstance(recovered, int):
-            ch, note = numeric_to_display(recovered)
-            recovered_characters.append(ch)
-            if note:
-                multibyte_notes += 1
-                if multibyte_notes <= 5:
-                    notes.append(f"位置 {position}: {note}")
+            recovered_characters.append(numeric_to_display(recovered))
         else:
             recovered_characters.append(recovered)
 
     text = "".join(recovered_characters)
     if ended:
         text = text.rstrip("?")
-    return text, notes, ended
+    return text, ended
 
 
 def analyze_target(observations: list[ProbeObservation]) -> AnalysisResult:
@@ -286,67 +300,59 @@ def analyze_target(observations: list[ProbeObservation]) -> AnalysisResult:
             position_groups[observation.position].append(observation)
 
     # Dual-polarity for length/fingerprint/status (NOT time-based: slow=true is fixed).
-    candidates: list[tuple[TruthClassifier | None, str, float]] = [
-        (truth_classifier, truth_source, confidence),
-    ]
+    # Run primary first; only invert when recovery looks weak (big win on long hex dumps).
+    primary = (truth_classifier, truth_source, confidence)
     allow_invert = truth_classifier is not None and not truth_source.startswith("响应时延")
-    if allow_invert:
-        candidates.append(
-            (invert_classifier(truth_classifier), truth_source + " [极性取反]", max(0.35, confidence - 0.1))
-        )
 
-    best_payload: tuple[tuple[int, int, int, int, int], str, list[str], int | None, str, float] | None = None
-
-    for clf, src, conf in candidates:
-        notes: list[str] = []
+    def _recover(clf: TruthClassifier | None, src: str, conf: float) -> tuple[tuple[int, int, int, int, int], str, int | None, str, float]:
         inferred_length: int | None = None
         if length_group:
             inferred, _ = infer_group_value(length_group, clf)
             if isinstance(inferred, int) and inferred > 0:
                 inferred_length = inferred
-                notes.append(f"推断结果长度: {inferred}")
-
-        text, char_notes, _ended = recover_characters(position_groups, clf)
-        notes.extend(char_notes)
-
+        text, _ended = recover_characters(position_groups, clf)
         if inferred_length is not None and inferred_length > 0 and len(text) > inferred_length:
             text = text[:inferred_length]
-            notes.append(f"按推断长度对齐至 {inferred_length}")
-
         flag_match = FLAG_RE.search(text)
         if flag_match and "?" not in flag_match.group(0) and "\\x" not in flag_match.group(0):
             if len(text) <= len(flag_match.group(0)) + 8:
                 text = flag_match.group(0)
+        return (score_recovered_text(text), text, inferred_length, src, conf)
 
-        score = score_recovered_text(text)
-        payload = (score, text, notes, inferred_length, src, conf)
-        if best_payload is None or payload[0] > best_payload[0]:
-            best_payload = payload
+    best_payload = _recover(*primary)
+    if allow_invert:
+        score = best_payload[0]
+        # Clean flag / high-diversity printable → skip expensive invert pass.
+        needs_invert = score[0] == 0 and (score[4] < -2 or score[2] < 8 or score[1] <= 2)
+        if needs_invert:
+            inverted = _recover(
+                invert_classifier(truth_classifier),
+                truth_source + " [极性取反]",
+                max(0.35, confidence - 0.1),
+            )
+            if inverted[0] > best_payload[0]:
+                best_payload = inverted
 
-    assert best_payload is not None
-    _score, text, notes, inferred_length, src, conf = best_payload
-    if src != truth_source:
-        notes.insert(0, "已按还原质量切换真值极性")
-        result.polarity_confidence = conf
-    else:
-        result.polarity_confidence = confidence
+    _score, text, inferred_length, src, conf = best_payload
+    polarity_flipped = src != truth_source
+    result.polarity_confidence = conf if polarity_flipped else confidence
 
     result.truth_source = src.replace(" [极性取反]", "")
-    if "已按还原质量切换真值极性" in notes:
+    if polarity_flipped:
         result.truth_source = result.truth_source + "(已校正极性)"
     result.inferred_length = inferred_length
-    result.notes = notes
     result.recovered_text = text
-    result.shape_hint = detect_shape(text)
-    if result.shape_hint and result.shape_hint not in result.notes:
-        result.notes.append(result.shape_hint)
+    enrich_recovered_result(result)
     return result
 
 
 def rank_analysis_result(result: AnalysisResult) -> tuple[int, int, int, int, int]:
-    highlighted = 1 if FLAG_RE.search(result.recovered_text) else 0
-    resolved = len(result.recovered_text) - result.recovered_text.count("?") - result.recovered_text.count("\\x")
-    unresolved = result.recovered_text.count("?")
+    highlighted = 1 if (result.embedded_flags or FLAG_RE.search(result.recovered_text or "")) else 0
+    text = result.recovered_text or ""
+    resolved = len(text) - text.count("?") - text.count("\\x")
+    if result.file_size:
+        resolved = max(resolved, result.file_size)
+    unresolved = text.count("?")
     return (highlighted, resolved, -unresolved, result.observation_count, int(result.polarity_confidence * 100))
 
 
@@ -389,9 +395,6 @@ def _apply_cross_length_hints(results: list[AnalysisResult]) -> None:
             count += 1
         result.recovered_text = "".join(kept)
         result.inferred_length = length
-        note = f"按交叉长度探针对齐至 {length}"
-        if note not in result.notes:
-            result.notes.append(note)
 
 
 def analyze_builtin_groups(observations: list[ProbeObservation]) -> list[AnalysisResult]:
@@ -399,6 +402,8 @@ def analyze_builtin_groups(observations: list[ProbeObservation]) -> list[Analysi
     results = [analyze_target(group) for group in grouped.values()]
     results = [r for r in results if r.recovered_text or r.inferred_length is not None]
     _apply_cross_length_hints(results)
+    for result in results:
+        enrich_recovered_result(result)
     return sorted(results, key=rank_analysis_result, reverse=True)
 
 
