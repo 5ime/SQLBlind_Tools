@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import re
 import subprocess
 from pathlib import Path
 
@@ -19,6 +20,12 @@ from .decode import (
 from .models import Config, HTTPRequestRecord, RawRequest, RawResponse, ToolError
 
 NOISE_METHODS = {"M-SEARCH", "NOTIFY", "SUBSCRIBE"}
+PCAP_SUFFIXES = {".pcap", ".pcapng", ".cap"}
+LOG_SUFFIXES = {".log", ".txt"}
+# Apache/Nginx common+combined style: ... "METHOD path PROTO" status size
+ACCESS_LOG_RE = re.compile(
+    r'"([A-Z]+) ((?:[^"\\]|\\.)*) HTTP/[0-9.]+"\s+(\d{3})\s+(\d+|-)'
+)
 
 
 def parse_tshark_int(value: str) -> int | None:
@@ -80,7 +87,6 @@ def run_tshark_capture(pcap_file: Path) -> tuple[list[RawRequest], dict[int, Raw
     try:
         result = subprocess.run(
             cmd,
-            check=True,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -88,11 +94,14 @@ def run_tshark_capture(pcap_file: Path) -> tuple[list[RawRequest], dict[int, Raw
         )
     except FileNotFoundError as exc:
         raise ToolError("未找到 tshark，请先安装 Wireshark/tshark 并确保其在 PATH 中。") from exc
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "").strip()
-        raise ToolError(f"tshark 执行失败: {stderr or exc}") from exc
 
-    reader = csv.reader(io.StringIO(result.stdout), delimiter="\t", quotechar='"')
+    stderr = (result.stderr or "").strip()
+    # Truncated captures often exit 14 while still emitting usable rows.
+    truncated = "cut short" in stderr.lower() or "appears to have been cut short" in stderr.lower()
+    if result.returncode not in (0, None) and not (truncated and result.stdout):
+        raise ToolError(f"tshark 执行失败: {stderr or f'exit {result.returncode}'}")
+
+    reader = csv.reader(io.StringIO(result.stdout or ""), delimiter="\t", quotechar='"')
     request_rows: list[RawRequest] = []
     response_rows: dict[int, RawResponse] = {}
 
@@ -210,7 +219,64 @@ def run_pyshark_capture(pcap_file: Path) -> tuple[list[RawRequest], dict[int, Ra
     return request_rows, response_rows
 
 
+def extract_http_from_access_log(log_file: Path) -> tuple[list[RawRequest], dict[int, RawResponse]]:
+    """Parse Apache/Nginx access logs into request/response pairs.
+
+    Access logs lack response bodies, so truth classification falls back to
+    status code / content-length clusters (common for boolean blinds logged there).
+    """
+    request_rows: list[RawRequest] = []
+    response_rows: dict[int, RawResponse] = {}
+    try:
+        text = log_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise ToolError(f"无法读取日志: {log_file}") from exc
+
+    frame = 1
+    for line in text.splitlines():
+        match = ACCESS_LOG_RE.search(line)
+        if match is None:
+            continue
+        method, path, status_raw, size_raw = match.groups()
+        if method.upper() in NOISE_METHODS:
+            continue
+        path = path.replace('\\"', '"')
+        status_code = int(status_raw)
+        content_length = None if size_raw == "-" else int(size_raw)
+        req_frame = frame
+        resp_frame = frame + 1
+        request_rows.append(
+            RawRequest(
+                frame_number=req_frame,
+                stream_id=req_frame,
+                method=method.upper(),
+                host="",
+                uri=path,
+                body="",
+                response_in=resp_frame,
+            )
+        )
+        response_rows[resp_frame] = RawResponse(
+            frame_number=resp_frame,
+            request_in=req_frame,
+            status_code=status_code,
+            content_length=content_length,
+            content_encoding="",
+            body="",
+            response_time=None,
+        )
+        frame += 2
+    return request_rows, response_rows
+
+
 def extract_http_from_pcap(config: Config) -> tuple[list[RawRequest], dict[int, RawResponse]]:
+    suffix = config.file.suffix.lower()
+    if suffix in LOG_SUFFIXES or suffix == "":
+        # Bare name like "sql" may still be an access log.
+        if suffix in LOG_SUFFIXES or _looks_like_access_log(config.file):
+            return extract_http_from_access_log(config.file)
+    if suffix not in PCAP_SUFFIXES and _looks_like_access_log(config.file):
+        return extract_http_from_access_log(config.file)
     if config.engine == "tshark":
         return run_tshark_capture(config.file)
     if config.engine == "pyshark":
@@ -218,7 +284,34 @@ def extract_http_from_pcap(config: Config) -> tuple[list[RawRequest], dict[int, 
     raise ToolError(f"未知 engine: {config.engine}")
 
 
-def normalize_request(row: RawRequest, response_rows: dict[int, RawResponse]) -> HTTPRequestRecord:
+def _looks_like_access_log(path: Path) -> bool:
+    try:
+        sample = path.read_bytes()[:4096].decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    return ACCESS_LOG_RE.search(sample) is not None
+
+
+def _fingerprint_body(data: bytes) -> str:
+    """Stable fingerprint; avoid hashing multi-MB bodies byte-for-byte twice."""
+    n = len(data)
+    if n <= 8192:
+        return hashlib.sha1(data).hexdigest()
+    # length + head + mid + tail — enough to separate true/false response templates
+    mid = n // 2
+    digest = hashlib.sha1()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(data[:2048])
+    digest.update(data[mid : mid + 1024])
+    digest.update(data[-1024:])
+    return digest.hexdigest()
+
+
+def normalize_request(
+    row: RawRequest,
+    response_rows: dict[int, RawResponse],
+    response_by_request: dict[int, RawResponse] | None = None,
+) -> HTTPRequestRecord:
     decoded_uri = recursive_unquote(row.uri)
     raw_body_bytes = decode_possibly_hex_body(row.body)
     decoded_body = recursive_unquote(bytes_to_text(raw_body_bytes), plus_as_space=True)
@@ -240,7 +333,9 @@ def normalize_request(row: RawRequest, response_rows: dict[int, RawResponse]) ->
     response = None
     if row.response_in is not None:
         response = response_rows.get(row.response_in)
-    if response is None:
+    if response is None and response_by_request is not None:
+        response = response_by_request.get(row.frame_number)
+    elif response is None:
         response = next((item for item in response_rows.values() if item.request_in == row.frame_number), None)
 
     response_body_length = None
@@ -249,12 +344,13 @@ def normalize_request(row: RawRequest, response_rows: dict[int, RawResponse]) ->
     if response and response.body:
         resp_bytes = decode_possibly_hex_body(response.body)
         resp_bytes = decompress_body(resp_bytes, response.content_encoding)
-        decoded_response_body = bytes_to_text(resp_bytes)
-        response_body_length = len(decoded_response_body)
-        response_fingerprint = hashlib.sha1(
-            decoded_response_body.encode("utf-8", errors="replace")
-        ).hexdigest()
-        response_preview = decoded_response_body[:200]
+        response_body_length = len(resp_bytes)
+        response_fingerprint = _fingerprint_body(resp_bytes)
+        response_preview = bytes_to_text(resp_bytes[:200])
+    elif response and response.content_length is not None:
+        # Access-log path: no body, length/status still usable for boolean clustering.
+        response_body_length = response.content_length
+        response_fingerprint = f"len:{response.content_length}|code:{response.status_code}"
 
     return HTTPRequestRecord(
         frame_number=row.frame_number,
@@ -274,4 +370,7 @@ def normalize_request(row: RawRequest, response_rows: dict[int, RawResponse]) ->
 
 
 def build_records(request_rows: list[RawRequest], response_rows: dict[int, RawResponse]) -> list[HTTPRequestRecord]:
-    return [normalize_request(row, response_rows) for row in request_rows]
+    response_by_request = {
+        item.request_in: item for item in response_rows.values() if item.request_in is not None
+    }
+    return [normalize_request(row, response_rows, response_by_request) for row in request_rows]
